@@ -88,6 +88,8 @@ def train_one_seed(
     seed: int,
     X: np.ndarray,
     y_bin: np.ndarray,
+    X_test: np.ndarray,
+    y_test_bin: np.ndarray,
     manifest: dict,
     cfg_train,
     device: torch.device,
@@ -100,19 +102,13 @@ def train_one_seed(
     bs       = int(cfg_train.batch_size)
     patience = int(cfg_train.patience)
 
-    # S1/S2/S3 비교가 유효하도록 모든 seed가 동일한 frozen split을 사용한다.
+    # train/val: dataset_train.npz 인덱스 / test: dataset_test.npz 전체
     idx_train = np.asarray(manifest['train_idx'], dtype=np.int64)
-    idx_val   = np.asarray(manifest['val_idx'], dtype=np.int64)
-    idx_test  = np.asarray(manifest['test_idx'], dtype=np.int64)
-    for name, split_idx in [('train', idx_train), ('val', idx_val), ('test', idx_test)]:
-        if len(split_idx) == 0:
-            raise ValueError(f'{name} split is empty')
-        if split_idx.min() < 0 or split_idx.max() >= len(X):
-            raise ValueError(f'{name} split contains indices outside dataset size {len(X)}')
+    idx_val   = np.asarray(manifest['val_idx'],   dtype=np.int64)
 
-    train_loader = make_loader(X[idx_train], y_bin[idx_train], bs, shuffle=True)
-    val_loader   = make_loader(X[idx_val],   y_bin[idx_val],   bs)
-    test_loader  = make_loader(X[idx_test],  y_bin[idx_test],  bs)
+    train_loader = make_loader(X[idx_train],   y_bin[idx_train], bs, shuffle=True)
+    val_loader   = make_loader(X[idx_val],     y_bin[idx_val],   bs)
+    test_loader  = make_loader(X_test, y_test_bin, bs)
 
     model     = DCNN(num_classes=2).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -183,18 +179,21 @@ def main():
     cfg_train = OmegaConf.load('configs/train.yaml').train
     cfg_exp   = OmegaConf.load('configs/experiment.yaml').experiment
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     print(f'Using device: {device}')
 
-    X, y, meta = load_dataset(cfg_exp.npz_path)
-    y_bin = binarize(y)
+    X,      y,      _ = load_dataset(cfg_exp.train_npz_path)
+    X_test, y_test, _ = load_dataset(cfg_exp.test_npz_path)
+    y_bin      = binarize(y)
+    y_test_bin = binarize(y_test)
     unique, counts = np.unique(y_bin, return_counts=True)
-    print(f'Dataset: X={X.shape}  binary distribution: {dict(zip(unique.tolist(), counts.tolist()))}')
+    print(f'Train: X={X.shape}  binary={dict(zip(unique.tolist(), counts.tolist()))}')
+    print(f'Test:  X={X_test.shape}')
 
     with open(cfg_exp.manifest_path) as f:
         manifest = json.load(f)
     print(f'Manifest: train={len(manifest["train_idx"])}, '
-          f'val={len(manifest["val_idx"])}, test={len(manifest["test_idx"])}')
+          f'val={len(manifest["val_idx"])}, test(frozen)={len(manifest["test_idx"])}')
 
     seeds      = [0] if args.smoke else list(cfg_train.seeds)
     max_epochs = 1   if args.smoke else None
@@ -202,7 +201,8 @@ def main():
     rows = []
     for seed in seeds:
         print(f'\n=== seed={seed} ===')
-        m = train_one_seed(seed, X, y_bin, manifest, cfg_train, device, max_epochs)
+        m = train_one_seed(seed, X, y_bin, X_test, y_test_bin,
+                           manifest, cfg_train, device, max_epochs)
         rows.append({
             'seed':          m['seed'],
             'accuracy':      m['accuracy'],

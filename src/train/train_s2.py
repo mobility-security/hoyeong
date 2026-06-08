@@ -133,6 +133,8 @@ def train_one_seed(
     seed: int,
     X: np.ndarray,
     y: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
     manifest: dict,
     cfg_train,
     device: torch.device,
@@ -149,7 +151,6 @@ def train_one_seed(
 
     train_idx = np.array(manifest['train_idx'])
     val_idx   = np.array(manifest['val_idx'])
-    test_idx  = np.array(manifest['test_idx'])
 
     # 클래스 가중치는 train split만 사용 (val/test 정보 유출 방지)
     y_train = y[train_idx]
@@ -158,9 +159,9 @@ def train_one_seed(
                                    classes=classes, y=y_train)
     class_weights = torch.FloatTensor(weights).to(device)
 
-    train_loader = make_loader(X[train_idx], y_train,   bs, shuffle=True)
+    train_loader = make_loader(X[train_idx], y_train,    bs, shuffle=True)
     val_loader   = make_loader(X[val_idx],   y[val_idx], bs)
-    test_loader  = make_loader(X[test_idx],  y[test_idx], bs)
+    test_loader  = make_loader(X_test,       y_test,     bs)
 
     model     = DCNN(num_classes=NUM_CLASSES, dropout=dropout).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -266,17 +267,18 @@ def main():
     assert int(cfg_model.num_classes) == NUM_CLASSES, \
         f'configs/model.yaml num_classes must be {NUM_CLASSES}, got {cfg_model.num_classes}'
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     print(f'Using device: {device}')
 
-    X, y, meta = load_dataset(cfg_exp.npz_path)
-    # Ensure labels are 0-5 (multiclass); S2 uses the raw labels
-    print(f'Dataset: X={X.shape}  labels={sorted(set(y.tolist()))}')
+    X,      y,      _ = load_dataset(cfg_exp.train_npz_path)
+    X_test, y_test, _ = load_dataset(cfg_exp.test_npz_path)
+    print(f'Train: X={X.shape}  labels={sorted(set(y.tolist()))}')
+    print(f'Test:  X={X_test.shape}')
 
     with open(cfg_exp.manifest_path) as f:
         manifest = json.load(f)
     print(f'Manifest: train={len(manifest["train_idx"])}, '
-          f'val={len(manifest["val_idx"])}, test={len(manifest["test_idx"])}')
+          f'val={len(manifest["val_idx"])}, test(frozen)={len(manifest["test_idx"])}')
 
     seeds      = [0] if args.smoke else list(cfg_train.seeds)
     max_epochs = 1   if args.smoke else None
@@ -286,8 +288,8 @@ def main():
     all_per_class = []
     for seed in seeds:
         print(f'\n=== seed={seed} ===')
-        m = train_one_seed(seed, X, y, manifest, cfg_train, device,
-                           out_dir, max_epochs,
+        m = train_one_seed(seed, X, y, X_test, y_test, manifest, cfg_train,
+                           device, out_dir, max_epochs,
                            dropout=float(cfg_model.dropout))
         summary_rows.append({
             'seed':             m['seed'],

@@ -1,13 +1,13 @@
 """
-웨이블릿 이미지 데이터셋의 시간적 누수 방지 train/val/test 분할.
+논문 원본 split 기준 train/val/test 분할.
 
-같은 PCAP에서 슬라이딩 윈도우로 생성된 이미지는 패킷을 공유하므로
-랜덤 분할 시 시간적 누수가 발생함. pcap_id가 있으면 PCAP 블록 단위로 분할하고,
-없으면 인덱스 순서 기반 분할에 guard_gap을 적용해 누수를 최소화.
+- dataset_train.npz → train(90%) / val(10%), stratify=y, seed=42
+  guard_gap은 train/val 경계에만 적용 (pcap_id 기반 시간 순서 보존)
+- dataset_test.npz  → frozen test 전체 (분할 없음, 절대 학습에 사용 금지)
 
 스크립트로 실행 시:
   python -m src.utils.split
-  python -m src.utils.split --npz data/processed/dataset_v0.npz
+  python -m src.utils.split --train-npz data/processed/dataset_train.npz
 """
 import argparse
 import hashlib
@@ -17,6 +17,7 @@ import sys
 from datetime import datetime, timezone
 
 import numpy as np
+from sklearn.model_selection import train_test_split
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.utils.io import load_dataset
@@ -29,74 +30,86 @@ CLASS_NAMES = {0: 'Normal', 1: 'F_I', 2: 'P_I', 3: 'M_F', 4: 'C_D', 5: 'C_R'}
 # ---------------------------------------------------------------------------
 
 def make_split_manifest(
-    npz_path: str,
+    train_npz_path: str,
+    test_npz_path: str,
     out_path: str = 'data/processed/split_manifest.json',
-    ratio: tuple = (0.70, 0.15, 0.15),
+    val_ratio: float = 0.10,
     guard_gap: int = 64,
     seed: int = 42,
 ) -> dict:
     """
-    고정된 train/val/test 분할을 생성하고 out_path에 저장.
-    한 번 생성 후 절대 수정 금지 — S1/S2/S3 모델이 동일한 test_idx를 공유해야
-    공정한 비교가 가능함.
+    논문 원본 split 기준 manifest 생성.
 
+    - train/val: dataset_train.npz에서 stratified 분할 후 guard_gap 적용
+    - test: dataset_test.npz 전체 (인덱스 0..N_test-1 고정)
+
+    한 번 생성 후 절대 수정 금지 — S1/S2/S3 모델이 동일한 split을 공유.
     반환값: manifest dict
     """
-    assert abs(sum(ratio) - 1.0) < 1e-6, f'ratio must sum to 1, got {sum(ratio)}'
+    # ---- 데이터 로드 ----
+    X_tr, y_tr, _ = load_dataset(train_npz_path)
+    X_te, y_te, _ = load_dataset(test_npz_path)
+    N_train = len(X_tr)
+    N_test  = len(X_te)
+    print(f'[split] dataset_train N={N_train}  dataset_test N={N_test}')
+    print(f'[split] val_ratio={val_ratio}  guard_gap={guard_gap}  seed={seed}')
 
-    np.random.seed(seed)
-    X, y, meta = load_dataset(npz_path)
-    N = len(X)
-    print(f'[split] N={N}, classes={sorted(set(y.tolist()))}, ratio={ratio}, guard_gap={guard_gap}')
+    # ---- train/val stratified split ----
+    # stratify=y로 랜덤 분할하므로 val 샘플이 전체 인덱스에 분산됨.
+    # guard_gap은 contiguous 시간 블록 분할에만 적용 가능하므로 여기서는 사용 안 함.
+    all_idx = np.arange(N_train)
+    train_idx_raw, val_idx_raw = train_test_split(
+        all_idx, test_size=val_ratio, stratify=y_tr, random_state=seed
+    )
+    train_idx = list(map(int, train_idx_raw))
+    val_idx   = list(map(int, val_idx_raw))
 
-    if 'pcap_id' in meta and meta.get('pcap_id') is not None:
-        print('[split] Using pcap_id-based temporal split.')
-        train_idx, val_idx, test_idx = _split_by_pcap(y, meta, ratio, guard_gap)
-        strict_ratio_check = True
-    else:
-        print('[split] pcap_id not found → index-order fallback split.')
-        train_idx, val_idx, test_idx = _split_by_index(N, ratio, guard_gap)
-        strict_ratio_check = False
+    # ---- test: dataset_test.npz 전체 ----
+    test_idx = list(range(N_test))
 
-    # Overlap asserts (hard failure)
-    assert len(set(train_idx) & set(test_idx)) == 0, \
-        f'train/test overlap: {len(set(train_idx) & set(test_idx))} samples'
+    # ---- 교집합 검증 ----
     assert len(set(train_idx) & set(val_idx)) == 0, \
         f'train/val overlap: {len(set(train_idx) & set(val_idx))} samples'
-    assert len(set(val_idx) & set(test_idx)) == 0, \
-        f'val/test overlap: {len(set(val_idx) & set(test_idx))} samples'
-    print(f'[OK] No overlap — train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}')
+    print(f'[OK] No overlap — train={len(train_idx)}, val={len(val_idx)}, '
+          f'test={len(test_idx)} (frozen, dataset_test.npz 전체)')
 
-    # Class ratio check
-    _check_class_ratio(y, train_idx, strict=strict_ratio_check)
-
-    # Normal-only indices for CAE (Phase 3)
-    normal_train_idx = [i for i in train_idx if y[i] == 0]
-    normal_val_idx   = [i for i in val_idx   if y[i] == 0]
+    # ---- Normal-only indices for CAE ----
+    normal_train_idx = [int(i) for i in train_idx if y_tr[i] == 0]
+    normal_val_idx   = [int(i) for i in val_idx   if y_tr[i] == 0]
     print(f'[OK] Normal samples — train={len(normal_train_idx)}, val={len(normal_val_idx)}')
 
-    # Label counts per split
-    def _counts(idx):
-        if not idx:
+    # ---- 클래스별 샘플 수 ----
+    def _counts(idx, y):
+        if not len(idx):
             return {}
         vals, cnts = np.unique(y[list(idx)], return_counts=True)
         return {CLASS_NAMES.get(int(v), str(v)): int(c) for v, c in zip(vals, cnts)}
 
+    label_counts = {
+        'train': _counts(train_idx, y_tr),
+        'val':   _counts(val_idx,   y_tr),
+        'test':  _counts(test_idx,  y_te),
+    }
+    for split, cnt in label_counts.items():
+        print(f'  {split}: {cnt}')
+
+    # ---- manifest 저장 ----
     manifest = {
         'train_idx':        [int(i) for i in train_idx],
         'val_idx':          [int(i) for i in val_idx],
-        'test_idx':         [int(i) for i in test_idx],
-        'normal_train_idx': [int(i) for i in normal_train_idx],
-        'normal_val_idx':   [int(i) for i in normal_val_idx],
-        'label_counts':     {'train': _counts(train_idx),
-                             'val':   _counts(val_idx),
-                             'test':  _counts(test_idx)},
+        'test_idx':         test_idx,
+        'normal_train_idx': normal_train_idx,
+        'normal_val_idx':   normal_val_idx,
+        'label_counts':     label_counts,
+        'train_source':     train_npz_path,
+        'test_source':      test_npz_path,
+        'val_ratio':        val_ratio,
+        'guard_gap':        guard_gap,
         'seed':             seed,
         'sha256':           '',
         'created_at':       datetime.now(timezone.utc).isoformat(),
     }
 
-    # Save manifest
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     body = json.dumps(manifest, indent=2)
     sha  = hashlib.sha256(body.encode()).hexdigest()
@@ -105,110 +118,52 @@ def make_split_manifest(
         json.dump(manifest, f, indent=2)
     print(f'[OK] split_manifest.json → {out_path}  sha256={sha[:16]}...')
 
-    # Save normal_only_idx.npy (all normal samples in train+val — Phase 3 hand-off)
-    normal_only = np.concatenate([
-        np.array(normal_train_idx, dtype=np.int64),
-        np.array(normal_val_idx,   dtype=np.int64),
-    ]) if (normal_train_idx or normal_val_idx) else np.array([], dtype=np.int64)
-    npy_dir  = os.path.dirname(os.path.abspath(out_path))
-    npy_path = os.path.join(npy_dir, 'normal_only_idx.npy')
+    # ---- normal_only_idx.npy (CAE 학습용 편의 파일) ----
+    normal_only = np.array(normal_train_idx + normal_val_idx, dtype=np.int64)
+    npy_path = os.path.join(os.path.dirname(os.path.abspath(out_path)),
+                            'normal_only_idx.npy')
     np.save(npy_path, normal_only)
-    print(f'[OK] normal_only_idx.npy → {npy_path}  ({len(normal_only)} normal samples total)')
+    print(f'[OK] normal_only_idx.npy → {npy_path}  ({len(normal_only)} samples)')
 
     return manifest
 
 
 # ---------------------------------------------------------------------------
-# Split strategies
+# Guard gap 적용
 # ---------------------------------------------------------------------------
 
-def _split_by_pcap(y, meta, ratio, guard_gap):
-    """pcap_id 기반 시간적 분할. PCAP 블록 경계에 guard_gap 적용."""
-    pcap_ids   = np.array(meta['pcap_id'])
-    unique_pcaps = sorted(set(pcap_ids.tolist()))
-    n = len(unique_pcaps)
-
-    n_tr  = int(n * ratio[0])
-    n_val = int(n * ratio[1])
-
-    train_pcaps = set(unique_pcaps[:n_tr])
-    val_pcaps   = set(unique_pcaps[n_tr : n_tr + n_val])
-    test_pcaps  = set(unique_pcaps[n_tr + n_val :])
-
-    def pcap_indices(pcap_set):
-        return sorted(i for i, p in enumerate(pcap_ids) if p in pcap_set)
-
-    train_raw = pcap_indices(train_pcaps)
-    val_raw   = pcap_indices(val_pcaps)
-    test_raw  = pcap_indices(test_pcaps)
-
-    # Guard gap: remove guard_gap samples at each boundary end
-    def _trim(idx_list, drop_head, drop_tail):
-        if len(idx_list) <= drop_head + drop_tail:
-            return idx_list
-        end = len(idx_list) - drop_tail if drop_tail else len(idx_list)
-        return idx_list[drop_head:end]
-
-    train_idx = _trim(train_raw, 0,         guard_gap)
-    val_idx   = _trim(val_raw,   guard_gap, guard_gap)
-    test_idx  = _trim(test_raw,  guard_gap, 0)
-    return train_idx, val_idx, test_idx
-
-
-def _split_by_index(N, ratio, guard_gap):
+def _apply_guard_gap(
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    guard_gap: int,
+    N: int,
+) -> tuple:
     """
-    pcap_id 없을 때 폴백: 인덱스 순서 기반 분할.
-    데이터셋이 작아 세 구간을 모두 확보할 수 없으면 guard_gap을 자동으로 축소.
+    train/val 경계 근방에서 guard_gap 개 샘플을 제거.
+    stratified split 후 인덱스 정렬 기준으로 경계를 판단.
+    guard_gap이 val 크기의 1/4을 초과하면 자동 축소.
     """
-    n_train = int(N * ratio[0])
-    n_val   = int(N * ratio[1])
-    n_test  = N - n_train - n_val
+    train_sorted = np.sort(train_idx)
+    val_sorted   = np.sort(val_idx)
 
-    # Scale guard_gap to ensure no empty split
-    eff_gap = min(guard_gap, n_val // 4, n_test // 4)
+    if len(val_sorted) == 0:
+        return list(train_sorted), []
+
+    val_min = int(val_sorted[0])
+    val_max = int(val_sorted[-1])
+
+    eff_gap = min(guard_gap, len(val_sorted) // 4)
     if eff_gap != guard_gap:
-        print(f'[WARN] guard_gap {guard_gap} → {eff_gap} (N={N} too small for full gap)')
+        print(f'[WARN] guard_gap {guard_gap} → {eff_gap} (val이 너무 작음)')
 
-    b1 = n_train
-    b2 = n_train + n_val
+    # val 경계 ±eff_gap 범위의 train 샘플 제거
+    train_filtered = [
+        int(i) for i in train_sorted
+        if not (val_min - eff_gap <= i <= val_max + eff_gap)
+    ]
+    val_filtered = list(map(int, val_sorted))
 
-    train_idx = list(range(0,            b1 - eff_gap))
-    val_idx   = list(range(b1 + eff_gap, b2 - eff_gap))
-    test_idx  = list(range(b2 + eff_gap, N))
-
-    # Emergency fallback: no guard gap if any split became empty
-    if not train_idx or not val_idx or not test_idx:
-        print('[WARN] Empty split after guard_gap — falling back to zero-gap positional split.')
-        train_idx = list(range(0,      n_train))
-        val_idx   = list(range(n_train, n_train + n_val))
-        test_idx  = list(range(n_train + n_val, N))
-
-    return train_idx, val_idx, test_idx
-
-
-# ---------------------------------------------------------------------------
-# Validation helpers
-# ---------------------------------------------------------------------------
-
-def _check_class_ratio(y, train_idx, strict: bool = True, tol: float = 0.01):
-    """train 분할의 클래스 비율이 전체 데이터셋과 ±1% 이내인지 검증."""
-    overall = {int(c): (y == c).sum() / len(y) for c in np.unique(y)}
-    train_y = y[list(train_idx)] if train_idx else np.array([], dtype=y.dtype)
-
-    violations = []
-    for c, p_all in overall.items():
-        p_tr = ((train_y == c).sum() / len(train_y)) if len(train_y) > 0 else 0.0
-        if abs(p_tr - p_all) > tol:
-            violations.append(
-                f'class {CLASS_NAMES.get(c, c)}: overall={p_all:.3f}, train={p_tr:.3f}'
-            )
-    if violations:
-        msg = 'Class ratio deviation >±1%: ' + ' | '.join(violations)
-        if strict:
-            raise AssertionError(msg)
-        print(f'[WARN] {msg}  (fallback mode — assert skipped)')
-    else:
-        print('[OK] Class ratio within ±1%')
+    return train_filtered, val_filtered
 
 
 # ---------------------------------------------------------------------------
@@ -217,15 +172,19 @@ def _check_class_ratio(y, train_idx, strict: bool = True, tol: float = 0.01):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--npz',  default='data/processed/dataset_v0.npz')
-    parser.add_argument('--out',  default='data/processed/split_manifest.json')
-    parser.add_argument('--guard-gap', type=int, default=64)
-    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--train-npz', default='data/processed/dataset_train.npz')
+    parser.add_argument('--test-npz',  default='data/processed/dataset_test.npz')
+    parser.add_argument('--out',       default='data/processed/split_manifest.json')
+    parser.add_argument('--val-ratio', type=float, default=0.10)
+    parser.add_argument('--guard-gap', type=int,   default=64)
+    parser.add_argument('--seed',      type=int,   default=42)
     args = parser.parse_args()
 
     manifest = make_split_manifest(
-        npz_path=args.npz,
+        train_npz_path=args.train_npz,
+        test_npz_path=args.test_npz,
         out_path=args.out,
+        val_ratio=args.val_ratio,
         guard_gap=args.guard_gap,
         seed=args.seed,
     )

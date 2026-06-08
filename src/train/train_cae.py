@@ -188,11 +188,12 @@ def main():
     cfg_exp = OmegaConf.load('configs/experiment.yaml').experiment
     set_seed(42)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     print(f'Using device: {device}')
 
     # ---- Load data + manifest ----
-    X, y, _ = load_dataset(cfg_exp.npz_path)
+    # CAE는 train 데이터만 사용 (test는 절대 사용 금지)
+    X, y, _ = load_dataset(cfg_exp.train_npz_path)
     with open(cfg_exp.manifest_path) as f:
         manifest = json.load(f)
 
