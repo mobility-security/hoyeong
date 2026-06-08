@@ -11,7 +11,19 @@ def load_dataset(path: str):
     data = np.load(path, allow_pickle=True)
     X = data['X']
     y = data['y']
-    meta = json.loads(str(data['meta']))
+
+    # meta 키 이름이 파일마다 다를 수 있음 (stub: 'meta', 실제: 'meta_json')
+    if 'meta_json' in data:
+        meta = json.loads(bytes(data['meta_json']).decode('utf-8'))
+    elif 'meta' in data:
+        meta = json.loads(str(data['meta']))
+    else:
+        meta = {}
+
+    # pcap_id가 있으면 meta에 포함 (시간적 누수 방지 분할에 사용됨)
+    if 'pcap_id' in data:
+        meta['pcap_id'] = data['pcap_id'].tolist()
+
     validate_schema(X, y)
     return X, y, meta
 

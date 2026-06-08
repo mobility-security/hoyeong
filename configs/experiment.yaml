@@ -1,6 +1,7 @@
 experiment:
-  npz_path: data/processed/dataset_v0.npz
-  manifest_path: data/processed/split_manifest.json
-  use_cae: false       # Day9 게이트용 스위치
+  train_npz_path: data/processed/dataset_train.npz   # 학습/val 분할 원본
+  test_npz_path:  data/processed/dataset_test.npz    # 논문 원본 frozen test (절대 학습에 사용 금지)
+  manifest_path:  data/processed/split_manifest.json
+  use_cae: false       # true → Stage 1 CAE 게이트 활성화 / false → S2 단독 모드
   conf_thr: 0.5
   output_dir: results/
